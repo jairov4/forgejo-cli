@@ -889,6 +889,7 @@ async fn view_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre
 enum PrStatus {
     Merged {
         pr: forgejo_api::structs::PullRequest,
+        commit_statuses: Vec<forgejo_api::structs::CommitStatus>,
     },
     Open {
         pr: forgejo_api::structs::PullRequest,
@@ -898,16 +899,18 @@ enum PrStatus {
 
 async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre::Result<PrStatus> {
     let pr = try_get_pr(repo, api, id).await?;
+    let sha = pr
+        .head
+        .as_ref()
+        .and_then(|head| head.sha.as_deref())
+        .ok_or_eyre("pr does not have head sha")?;
+    let commit_statuses = crate::ci::fetch_commit_statuses(repo, api, sha).await?;
     if pr.merged.ok_or_eyre("pr merge status unknown")? {
-        Ok(PrStatus::Merged { pr })
+        Ok(PrStatus::Merged {
+            pr,
+            commit_statuses,
+        })
     } else {
-        let sha = pr
-            .head
-            .as_ref()
-            .and_then(|head| head.sha.as_deref())
-            .ok_or_eyre("pr does not have head sha")?;
-        let commit_statuses = crate::ci::fetch_commit_statuses(repo, api, sha).await?;
-
         Ok(PrStatus::Open {
             pr,
             commit_statuses,
@@ -917,16 +920,20 @@ async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre:
 
 impl crate::ci::CiSnapshot for PrStatus {
     fn checks(&self) -> Option<(&str, &[forgejo_api::structs::CommitStatus])> {
-        match self {
-            PrStatus::Merged { .. } => None,
-            PrStatus::Open {
-                pr,
-                commit_statuses,
-            } => {
-                let sha = pr.head.as_ref().and_then(|h| h.sha.as_deref());
-                Some((sha.unwrap_or("?"), commit_statuses))
-            }
+        let (PrStatus::Merged {
+            pr,
+            commit_statuses,
         }
+        | PrStatus::Open {
+            pr,
+            commit_statuses,
+        }) = self;
+        let sha = pr.head.as_ref().and_then(|h| h.sha.as_deref());
+        Some((sha.unwrap_or("?"), commit_statuses))
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(self, PrStatus::Merged { .. })
     }
 
     fn print(&self) -> eyre::Result<()> {
@@ -936,7 +943,10 @@ impl crate::ci::CiSnapshot for PrStatus {
 
 fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
     match pr_status {
-        PrStatus::Merged { pr } => {
+        PrStatus::Merged {
+            pr,
+            commit_statuses,
+        } => {
             let merged_by = pr
                 .merged_by
                 .as_ref()
@@ -951,6 +961,7 @@ fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
                 merged_by,
                 merged_at = merged_at.ftl(),
             );
+            crate::ci::print_commit_statuses(commit_statuses)?;
         }
         PrStatus::Open {
             pr,

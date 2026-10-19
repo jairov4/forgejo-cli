@@ -62,6 +62,11 @@ pub trait CiSnapshot {
     /// means there is nothing left to wait for (e.g. the PR was merged).
     fn checks(&self) -> Option<(&str, &[CommitStatus])>;
     fn print(&self) -> eyre::Result<()>;
+    /// Whether nothing new can happen (e.g. the PR was merged), so a missing
+    /// check won't appear later and the grace period can be skipped.
+    fn is_final(&self) -> bool {
+        false
+    }
 }
 
 /// Fetches the latest status of each check on `reference` (a sha, branch or tag).
@@ -154,7 +159,9 @@ fn wait_outcome(snapshot: &impl CiSnapshot) -> Option<WaitOutcome> {
         return Some(WaitOutcome::Done);
     };
     let states = commit_statuses.iter().flat_map(|x| x.status.as_ref());
-    if commit_statuses.is_empty() {
+    if commit_statuses.is_empty() && snapshot.is_final() {
+        Some(WaitOutcome::Done)
+    } else if commit_statuses.is_empty() {
         Some(WaitOutcome::NoChecks)
     } else if states.clone().any(|s| *s == CommitStatusState::Pending) {
         None

@@ -647,7 +647,7 @@ msg-ci-no_checks = {STYLE("light-grey")}No checks reported{STYLE("reset")}
 help-arg-ci-wait = Wait for all checks to finish before exiting
 help-arg-ci-wait-long = Wait for all checks to finish before exiting.
 
-    Exits with 0 when all checks pass (or a waited-on PR is merged), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
+    Exits with 0 when all checks pass (or there are none), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
 help-arg-ci-timeout = Give up waiting after this long (e.g. `50m`, `2h`)
 help-arg-ci-interval = Maximum time between status polls
 help-arg-ci-grace = How long to wait for checks to appear before assuming there are none
