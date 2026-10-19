@@ -97,7 +97,9 @@ pub enum ReleaseSubcommand {
     },
     #[clap(about = h!("cmd-release-status"))]
     Status {
+        #[clap(help = h!("arg-release-status-name"))]
         name: String,
+        #[clap(help = h!("arg-release-status-by_tag"))]
         #[clap(long, short = 't')]
         by_tag: bool,
         #[clap(flatten)]

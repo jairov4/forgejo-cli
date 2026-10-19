@@ -1475,7 +1475,9 @@ help-cmd-release-list = List all the releases on a repo
 
 help-cmd-release-view = View a release's info
 
-help-cmd-release-status = View the CI status of a release's tag
+help-cmd-release-status = View (or wait for) the CI status of a release's tag
+help-arg-release-status-name = The release name, or its tag with `--by-tag`
+help-arg-release-status-by_tag = Look the release up by tag instead of by name
 msg-release-status-header = {$kind ->
         [draft] {STYLE("light-grey")}Draft{STYLE("reset")}
         [prerelease] {STYLE("bright-yellow")}Prerelease{STYLE("reset")}
