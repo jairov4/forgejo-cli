@@ -643,6 +643,7 @@ help-cmd-pr-view-files = View the files changed in a pull request
 help-cmd-pr-view-commits = View the commits in a pull request
 help-arg-pr-view-commits-oneline = View one commit per line
 
+msg-ci-no_checks = {STYLE("light-grey")}No checks reported{STYLE("reset")}
 help-arg-ci-wait = Wait for all checks to finish before exiting
 help-arg-ci-wait-long = Wait for all checks to finish before exiting.
 
@@ -1482,7 +1483,10 @@ msg-release-status-header = {$kind ->
         [draft] {STYLE("light-grey")}Draft{STYLE("reset")}
         [prerelease] {STYLE("bright-yellow")}Prerelease{STYLE("reset")}
        *[release] {STYLE("bright-green")}Release{STYLE("reset")}
-    } {$name} {-dash} tag {$tag}
+    } {$name} {-dash} tag {$tag} {$commit ->
+        [none] {STYLE("light-grey")}(tag not created yet){STYLE("reset")}
+       *[other] at {$commit}
+    }
 help-cmd-release-browse = Open a release in your browser
 
 help-cmd-release-asset = Commands on a release's attached files

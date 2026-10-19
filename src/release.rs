@@ -598,6 +598,9 @@ async fn download_asset(
 struct ReleaseStatus {
     release: forgejo_api::structs::Release,
     tag: String,
+    /// The commit the tag points to, or `None` if the tag doesn't exist yet
+    /// (e.g. a draft release).
+    sha: Option<String>,
     commit_statuses: Vec<forgejo_api::structs::CommitStatus>,
 }
 
@@ -617,12 +620,30 @@ async fn get_release_status(
         .tag_name
         .clone()
         .ok_or_eyre("release does not have a tag")?;
-    // CI for a release runs on the push of its tag, so its results are the
-    // statuses of the tagged commit.
-    let commit_statuses = crate::ci::fetch_commit_statuses(repo, api, &tag).await?;
+    // CI for a release runs on the push of its tag and reports its statuses on
+    // the tagged commit. Statuses must be looked up by that commit's sha: for
+    // an annotated tag, looking them up by tag name finds none.
+    let sha = match api.repo_get_tag(repo.owner(), repo.name(), &tag).await {
+        Ok(t) => Some(
+            t.commit
+                .and_then(|c| c.sha)
+                .ok_or_eyre("tag does not have a commit")?,
+        ),
+        Err(forgejo_api::ForgejoError::ApiError(e))
+            if matches!(e.error_kind(), forgejo_api::ApiErrorKind::NotFound { .. }) =>
+        {
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let commit_statuses = match &sha {
+        Some(sha) => crate::ci::fetch_commit_statuses(repo, api, sha).await?,
+        None => Vec::new(),
+    };
     Ok(ReleaseStatus {
         release,
         tag,
+        sha,
         commit_statuses,
     })
 }
@@ -635,14 +656,27 @@ impl ReleaseStatus {
             (_, Some(true)) => "prerelease",
             _ => "release",
         };
-        ftl_println!("msg-release-status-header", name, tag = &*self.tag, kind);
+        let commit = self
+            .sha
+            .as_deref()
+            .map_or("none", |s| &s[..s.len().min(10)]);
+        ftl_println!(
+            "msg-release-status-header",
+            name,
+            tag = &*self.tag,
+            kind,
+            commit
+        );
         crate::ci::print_commit_statuses(&self.commit_statuses)
     }
 }
 
 impl crate::ci::CiSnapshot for ReleaseStatus {
     fn checks(&self) -> Option<(&str, &[forgejo_api::structs::CommitStatus])> {
-        Some((&self.tag, &self.commit_statuses))
+        Some((
+            self.sha.as_deref().unwrap_or(&self.tag),
+            &self.commit_statuses,
+        ))
     }
 
     fn print(&self) -> eyre::Result<()> {

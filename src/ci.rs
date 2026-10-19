@@ -111,6 +111,9 @@ fn is_empty_combined_status(e: &forgejo_api::ForgejoError) -> bool {
 
 pub fn print_commit_statuses(commit_statuses: &[CommitStatus]) -> eyre::Result<()> {
     let SpecialRender { bullet, .. } = *crate::special_render();
+    if commit_statuses.is_empty() {
+        ftl_println!("msg-ci-no_checks");
+    }
     for status in commit_statuses {
         let state = status
             .status
