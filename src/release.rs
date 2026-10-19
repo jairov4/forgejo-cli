@@ -95,6 +95,14 @@ pub enum ReleaseSubcommand {
         #[clap(long, short = 't')]
         by_tag: bool,
     },
+    #[clap(about = h!("cmd-release-status"))]
+    Status {
+        name: String,
+        #[clap(long, short = 't')]
+        by_tag: bool,
+        #[clap(flatten)]
+        wait: crate::ci::WaitArgs,
+    },
     #[clap(about = h!("cmd-release-browse"))]
     Browse { name: Option<String> },
     #[clap(about = h!("cmd-release-asset"))]
@@ -166,6 +174,14 @@ impl ReleaseCommand {
             } => list_releases(repo, &api, include_prerelease, include_draft).await?,
             ReleaseSubcommand::View { name, by_tag } => {
                 view_release(repo, &api, name, by_tag).await?
+            }
+            ReleaseSubcommand::Status { name, by_tag, wait } => {
+                let fetch = || get_release_status(repo, &api, &name, by_tag);
+                if wait.wait {
+                    crate::ci::wait_for_checks(fetch, &wait).await?
+                } else {
+                    fetch().await?.print_status()?
+                }
             }
             ReleaseSubcommand::Browse { name } => browse_release(repo, &api, name).await?,
             ReleaseSubcommand::Asset(subcommand) => match subcommand {
@@ -575,6 +591,61 @@ async fn download_asset(
     );
 
     Ok(())
+}
+
+struct ReleaseStatus {
+    release: forgejo_api::structs::Release,
+    tag: String,
+    commit_statuses: Vec<forgejo_api::structs::CommitStatus>,
+}
+
+async fn get_release_status(
+    repo: &RepoName,
+    api: &Forgejo,
+    name: &str,
+    by_tag: bool,
+) -> eyre::Result<ReleaseStatus> {
+    let release = if by_tag {
+        api.repo_get_release_by_tag(repo.owner(), repo.name(), name)
+            .await?
+    } else {
+        find_release(repo, api, name).await?
+    };
+    let tag = release
+        .tag_name
+        .clone()
+        .ok_or_eyre("release does not have a tag")?;
+    // CI for a release runs on the push of its tag, so its results are the
+    // statuses of the tagged commit.
+    let commit_statuses = crate::ci::fetch_commit_statuses(repo, api, &tag).await?;
+    Ok(ReleaseStatus {
+        release,
+        tag,
+        commit_statuses,
+    })
+}
+
+impl ReleaseStatus {
+    fn print_status(&self) -> eyre::Result<()> {
+        let name = self.release.name.as_deref().unwrap_or(&self.tag);
+        let kind = match (self.release.draft, self.release.prerelease) {
+            (Some(true), _) => "draft",
+            (_, Some(true)) => "prerelease",
+            _ => "release",
+        };
+        ftl_println!("msg-release-status-header", name, tag = &*self.tag, kind);
+        crate::ci::print_commit_statuses(&self.commit_statuses)
+    }
+}
+
+impl crate::ci::CiSnapshot for ReleaseStatus {
+    fn checks(&self) -> Option<(&str, &[forgejo_api::structs::CommitStatus])> {
+        Some((&self.tag, &self.commit_statuses))
+    }
+
+    fn print(&self) -> eyre::Result<()> {
+        self.print_status()
+    }
 }
 
 async fn find_release(

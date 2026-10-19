@@ -643,15 +643,16 @@ help-cmd-pr-view-files = View the files changed in a pull request
 help-cmd-pr-view-commits = View the commits in a pull request
 help-arg-pr-view-commits-oneline = View one commit per line
 
+help-arg-ci-wait = Wait for all checks to finish before exiting
+help-arg-ci-wait-long = Wait for all checks to finish before exiting.
+
+    Exits with 0 when all checks pass (or a waited-on PR is merged), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
+help-arg-ci-timeout = Give up waiting after this long (e.g. `50m`, `2h`)
+help-arg-ci-interval = Maximum time between status polls
+help-arg-ci-grace = How long to wait for checks to appear before assuming there are none
+
 help-cmd-pr-status = View the mergability and CI status of a pull request
 help-arg-pr-status-id = The pull request to view
-help-arg-pr-status-wait = Wait for all checks to finish before exiting
-help-arg-pr-status-wait-long = Wait for all checks to finish before exiting.
-
-    Exits with 0 when all checks pass (or the PR is merged), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
-help-arg-pr-status-timeout = Give up waiting after this long (e.g. `50m`, `2h`)
-help-arg-pr-status-interval = Maximum time between status polls
-help-arg-pr-status-grace = How long to wait for checks to appear before assuming there are none
 msg-pr-status-merged = {STYLE("bright-magenta")}Merged{STYLE("reset")} by {$merged_by} on {DATETIME($merged_at, dateStyle: "long", timeStyle: "long")}
 msg-pr-status-header = {$state ->
         [draft] {STYLE("light-grey")}Draft{STYLE("reset")} {-dash} Can't merge draft PR
@@ -1474,6 +1475,12 @@ help-cmd-release-list = List all the releases on a repo
 
 help-cmd-release-view = View a release's info
 
+help-cmd-release-status = View the CI status of a release's tag
+msg-release-status-header = {$kind ->
+        [draft] {STYLE("light-grey")}Draft{STYLE("reset")}
+        [prerelease] {STYLE("bright-yellow")}Prerelease{STYLE("reset")}
+       *[release] {STYLE("bright-green")}Release{STYLE("reset")}
+    } {$name} {-dash} tag {$tag}
 help-cmd-release-browse = Open a release in your browser
 
 help-cmd-release-asset = Commands on a release's attached files

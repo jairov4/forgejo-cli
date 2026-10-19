@@ -11,6 +11,7 @@ use keys::*;
 
 mod actions;
 mod auth;
+mod ci;
 mod completion;
 mod issues;
 mod milestones;
