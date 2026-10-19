@@ -95,6 +95,16 @@ pub enum ReleaseSubcommand {
         #[clap(long, short = 't')]
         by_tag: bool,
     },
+    #[clap(about = h!("cmd-release-status"))]
+    Status {
+        #[clap(help = h!("arg-release-status-name"))]
+        name: String,
+        #[clap(help = h!("arg-release-status-by_tag"))]
+        #[clap(long, short = 't')]
+        by_tag: bool,
+        #[clap(flatten)]
+        wait: crate::ci::WaitArgs,
+    },
     #[clap(about = h!("cmd-release-browse"))]
     Browse { name: Option<String> },
     #[clap(about = h!("cmd-release-asset"))]
@@ -166,6 +176,14 @@ impl ReleaseCommand {
             } => list_releases(repo, &api, include_prerelease, include_draft).await?,
             ReleaseSubcommand::View { name, by_tag } => {
                 view_release(repo, &api, name, by_tag).await?
+            }
+            ReleaseSubcommand::Status { name, by_tag, wait } => {
+                let fetch = || get_release_status(repo, &api, &name, by_tag);
+                if wait.wait {
+                    crate::ci::wait_for_checks(fetch, &wait).await?
+                } else {
+                    fetch().await?.print_status()?
+                }
             }
             ReleaseSubcommand::Browse { name } => browse_release(repo, &api, name).await?,
             ReleaseSubcommand::Asset(subcommand) => match subcommand {
@@ -575,6 +593,95 @@ async fn download_asset(
     );
 
     Ok(())
+}
+
+struct ReleaseStatus {
+    release: forgejo_api::structs::Release,
+    tag: String,
+    /// The commit the tag points to, or `None` if the tag doesn't exist yet
+    /// (e.g. a draft release).
+    sha: Option<String>,
+    commit_statuses: Vec<forgejo_api::structs::CommitStatus>,
+}
+
+async fn get_release_status(
+    repo: &RepoName,
+    api: &Forgejo,
+    name: &str,
+    by_tag: bool,
+) -> eyre::Result<ReleaseStatus> {
+    let release = if by_tag {
+        api.repo_get_release_by_tag(repo.owner(), repo.name(), name)
+            .await?
+    } else {
+        find_release(repo, api, name).await?
+    };
+    let tag = release
+        .tag_name
+        .clone()
+        .ok_or_eyre("release does not have a tag")?;
+    // CI for a release runs on the push of its tag and reports its statuses on
+    // the tagged commit. Statuses must be looked up by that commit's sha: for
+    // an annotated tag, looking them up by tag name finds none.
+    let sha = match api.repo_get_tag(repo.owner(), repo.name(), &tag).await {
+        Ok(t) => Some(
+            t.commit
+                .and_then(|c| c.sha)
+                .ok_or_eyre("tag does not have a commit")?,
+        ),
+        Err(forgejo_api::ForgejoError::ApiError(e))
+            if matches!(e.error_kind(), forgejo_api::ApiErrorKind::NotFound { .. }) =>
+        {
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let commit_statuses = match &sha {
+        Some(sha) => crate::ci::fetch_commit_statuses(repo, api, sha).await?,
+        None => Vec::new(),
+    };
+    Ok(ReleaseStatus {
+        release,
+        tag,
+        sha,
+        commit_statuses,
+    })
+}
+
+impl ReleaseStatus {
+    fn print_status(&self) -> eyre::Result<()> {
+        let name = self.release.name.as_deref().unwrap_or(&self.tag);
+        let kind = match (self.release.draft, self.release.prerelease) {
+            (Some(true), _) => "draft",
+            (_, Some(true)) => "prerelease",
+            _ => "release",
+        };
+        let commit = self
+            .sha
+            .as_deref()
+            .map_or("none", |s| &s[..s.len().min(10)]);
+        ftl_println!(
+            "msg-release-status-header",
+            name,
+            tag = &*self.tag,
+            kind,
+            commit
+        );
+        crate::ci::print_commit_statuses(&self.commit_statuses)
+    }
+}
+
+impl crate::ci::CiSnapshot for ReleaseStatus {
+    fn checks(&self) -> Option<(&str, &[forgejo_api::structs::CommitStatus])> {
+        Some((
+            self.sha.as_deref().unwrap_or(&self.tag),
+            &self.commit_statuses,
+        ))
+    }
+
+    fn print(&self) -> eyre::Result<()> {
+        self.print_status()
+    }
 }
 
 async fn find_release(

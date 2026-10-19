@@ -11,6 +11,7 @@ use keys::*;
 
 mod actions;
 mod auth;
+mod ci;
 mod completion;
 mod issues;
 mod milestones;
@@ -140,10 +141,27 @@ async fn main() -> eyre::Result<()> {
     let _ = SPECIAL_RENDER.set(SpecialRender::new(args.style.unwrap_or_default()));
 
     let mut keys = KeyInfo::load().await?;
-    args.command.run(&mut keys, args.host.as_deref()).await?;
+    if let Err(e) = args.command.run(&mut keys, args.host.as_deref()).await {
+        if let Some(ExitCode(code)) = e.downcast_ref::<ExitCode>() {
+            std::process::exit(*code);
+        }
+        return Err(e);
+    }
 
     Ok(())
 }
+
+/// Error used to exit with a specific status code without printing an error report.
+#[derive(Debug)]
+pub struct ExitCode(pub i32);
+
+impl std::fmt::Display for ExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit code {}", self.0)
+    }
+}
+
+impl std::error::Error for ExitCode {}
 
 async fn readline() -> eyre::Result<String> {
     tokio::task::spawn_blocking(|| {

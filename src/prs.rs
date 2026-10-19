@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::{io::Write, str::FromStr};
+use std::str::FromStr;
 
 use clap::{Args, Subcommand};
 use eyre::{Context, OptionExt};
@@ -16,13 +16,12 @@ use forgejo_api::{
 use futures::stream::{StreamExt, TryStreamExt};
 
 use crate::{
-    SpecialRender,
+    ftl_bail, ftl_ensure, ftl_eprintln, ftl_eyre, ftl_format, ftl_println, h, lh, milestones,
+};
+use crate::{
     issues::IssueId,
     localization::AsFluent,
     repo::{RepoArg, RepoInfo, RepoName},
-};
-use crate::{
-    ftl_bail, ftl_ensure, ftl_eprintln, ftl_eyre, ftl_format, ftl_println, h, lh, milestones,
 };
 
 #[derive(Args, Clone, Debug)]
@@ -121,9 +120,8 @@ pub enum PrSubcommand {
     Status {
         #[clap(help = h!("arg-pr-status-id"))]
         id: Option<IssueId>,
-        #[clap(help = h!("arg-pr-status-wait"))]
-        #[clap(long)]
-        wait: bool,
+        #[clap(flatten)]
+        wait: crate::ci::WaitArgs,
     },
     #[clap(about = h!("cmd-pr-checkout"))]
     Checkout {
@@ -527,7 +525,14 @@ impl PrCommand {
                     }
                 }
             }
-            Status { id, wait } => view_pr_status(repo, &api, id.map(|id| id.number), wait).await?,
+            Status { id, wait } => {
+                let id = id.map(|id| id.number);
+                if wait.wait {
+                    crate::ci::wait_for_checks(|| get_pr_status(repo, &api, id), &wait).await?
+                } else {
+                    view_pr_status(repo, &api, id).await?
+                }
+            }
             Search {
                 query,
                 labels,
@@ -875,58 +880,16 @@ async fn view_pr_labels(repo: &RepoName, api: &Forgejo, pr: Option<i64>) -> eyre
     Ok(())
 }
 
-async fn view_pr_status(
-    repo: &RepoName,
-    api: &Forgejo,
-    id: Option<i64>,
-    wait: bool,
-) -> eyre::Result<()> {
-    if wait {
-        let SpecialRender { fancy, .. } = *crate::special_render();
-        let mut wait_duration = 5.0;
-        let mut prev_statuses_len = 0;
-        let pr_status = loop {
-            let pr_status = get_pr_status(repo, api, id).await?;
-            if fancy {
-                if prev_statuses_len > 0 {
-                    println!("\x1b[{prev_statuses_len}A");
-                }
-                print_pr_status(&pr_status)?;
-            } else {
-                print!(".");
-                std::io::stdout().flush()?;
-            }
-            match &pr_status {
-                PrStatus::Merged { .. } => break pr_status,
-                PrStatus::Open {
-                    commit_statuses, ..
-                } => {
-                    let all_finished = commit_statuses
-                        .iter()
-                        .flat_map(|x| x.status.as_ref())
-                        .all(|state| *state != forgejo_api::structs::CommitStatusState::Pending);
-                    if all_finished {
-                        break pr_status;
-                    }
-                    prev_statuses_len = commit_statuses.len() + 2;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs_f64(wait_duration)).await;
-            wait_duration *= 1.5;
-        };
-        if !fancy {
-            print_pr_status(&pr_status)?;
-        }
-    } else {
-        let pr_status = get_pr_status(repo, api, id).await?;
-        print_pr_status(&pr_status)?;
-    }
+async fn view_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre::Result<()> {
+    let pr_status = get_pr_status(repo, api, id).await?;
+    print_pr_status(&pr_status)?;
     Ok(())
 }
 
 enum PrStatus {
     Merged {
         pr: forgejo_api::structs::PullRequest,
+        commit_statuses: Vec<forgejo_api::structs::CommitStatus>,
     },
     Open {
         pr: forgejo_api::structs::PullRequest,
@@ -936,30 +899,18 @@ enum PrStatus {
 
 async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre::Result<PrStatus> {
     let pr = try_get_pr(repo, api, id).await?;
+    let sha = pr
+        .head
+        .as_ref()
+        .and_then(|head| head.sha.as_deref())
+        .ok_or_eyre("pr does not have head sha")?;
+    let commit_statuses = crate::ci::fetch_commit_statuses(repo, api, sha).await?;
     if pr.merged.ok_or_eyre("pr merge status unknown")? {
-        Ok(PrStatus::Merged { pr })
+        Ok(PrStatus::Merged {
+            pr,
+            commit_statuses,
+        })
     } else {
-        let sha = pr
-            .head
-            .as_ref()
-            .and_then(|head| head.sha.as_deref())
-            .ok_or_eyre("pr does not have head sha")?;
-        let mut commit_statuses = api
-            .repo_get_combined_status_by_ref(repo.owner(), repo.name(), sha)
-            .stream_pages()
-            .map_ok(|page| {
-                futures::stream::iter(
-                    page.statuses
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(Result::<_, forgejo_api::ForgejoError>::Ok),
-                )
-            })
-            .try_flatten()
-            .try_collect::<Vec<_>>()
-            .await?;
-        commit_statuses.sort_by(|a, b| a.context.cmp(&b.context));
-
         Ok(PrStatus::Open {
             pr,
             commit_statuses,
@@ -967,10 +918,35 @@ async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre:
     }
 }
 
+impl crate::ci::CiSnapshot for PrStatus {
+    fn checks(&self) -> Option<(&str, &[forgejo_api::structs::CommitStatus])> {
+        let (PrStatus::Merged {
+            pr,
+            commit_statuses,
+        }
+        | PrStatus::Open {
+            pr,
+            commit_statuses,
+        }) = self;
+        let sha = pr.head.as_ref().and_then(|h| h.sha.as_deref());
+        Some((sha.unwrap_or("?"), commit_statuses))
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(self, PrStatus::Merged { .. })
+    }
+
+    fn print(&self) -> eyre::Result<()> {
+        print_pr_status(self)
+    }
+}
+
 fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
-    let SpecialRender { bullet, .. } = *crate::special_render();
     match pr_status {
-        PrStatus::Merged { pr } => {
+        PrStatus::Merged {
+            pr,
+            commit_statuses,
+        } => {
             let merged_by = pr
                 .merged_by
                 .as_ref()
@@ -985,6 +961,7 @@ fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
                 merged_by,
                 merged_at = merged_at.ftl(),
             );
+            crate::ci::print_commit_statuses(commit_statuses)?;
         }
         PrStatus::Open {
             pr,
@@ -1000,28 +977,7 @@ fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
             let mergeable = pr.mergeable.ok_or_eyre("pr does not have mergeable")?;
             ftl_println!("msg-pr-status-header", state, mergeable = mergeable.ftl());
 
-            use forgejo_api::structs::CommitStatusState;
-
-            for status in commit_statuses {
-                let state = status
-                    .status
-                    .as_ref()
-                    .ok_or_eyre("status does not have status")?;
-                let context = status
-                    .context
-                    .as_deref()
-                    .ok_or_eyre("status does not have context")?;
-                print!("{bullet} ");
-                let state = match state {
-                    CommitStatusState::Success => "success",
-                    CommitStatusState::Pending => "pending",
-                    CommitStatusState::Warning => "warning",
-                    CommitStatusState::Failure => "failure",
-                    CommitStatusState::Skipped => "skipped",
-                    CommitStatusState::Error => "error",
-                };
-                ftl_println!("msg-pr-status-entry", state, context);
-            }
+            crate::ci::print_commit_statuses(commit_statuses)?;
         }
     }
     Ok(())

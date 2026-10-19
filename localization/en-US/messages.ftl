@@ -643,9 +643,17 @@ help-cmd-pr-view-files = View the files changed in a pull request
 help-cmd-pr-view-commits = View the commits in a pull request
 help-arg-pr-view-commits-oneline = View one commit per line
 
+msg-ci-no_checks = {STYLE("light-grey")}No checks reported{STYLE("reset")}
+help-arg-ci-wait = Wait for all checks to finish before exiting
+help-arg-ci-wait-long = Wait for all checks to finish before exiting.
+
+    Exits with 0 when all checks pass (or there are none), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
+help-arg-ci-timeout = Give up waiting after this long (e.g. `50m`, `2h`)
+help-arg-ci-interval = Maximum time between status polls
+help-arg-ci-grace = How long to wait for checks to appear before assuming there are none
+
 help-cmd-pr-status = View the mergability and CI status of a pull request
 help-arg-pr-status-id = The pull request to view
-help-arg-pr-status-wait = Wait for all checks to finish before exiting
 msg-pr-status-merged = {STYLE("bright-magenta")}Merged{STYLE("reset")} by {$merged_by} on {DATETIME($merged_at, dateStyle: "long", timeStyle: "long")}
 msg-pr-status-header = {$state ->
         [draft] {STYLE("light-grey")}Draft{STYLE("reset")} {-dash} Can't merge draft PR
@@ -1468,6 +1476,17 @@ help-cmd-release-list = List all the releases on a repo
 
 help-cmd-release-view = View a release's info
 
+help-cmd-release-status = View (or wait for) the CI status of a release's tag
+help-arg-release-status-name = The release name, or its tag with `--by-tag`
+help-arg-release-status-by_tag = Look the release up by tag instead of by name
+msg-release-status-header = {$kind ->
+        [draft] {STYLE("light-grey")}Draft{STYLE("reset")}
+        [prerelease] {STYLE("bright-yellow")}Prerelease{STYLE("reset")}
+       *[release] {STYLE("bright-green")}Release{STYLE("reset")}
+    } {$name} {-dash} tag {$tag} {$commit ->
+        [none] {STYLE("light-grey")}(tag not created yet){STYLE("reset")}
+       *[other] at {$commit}
+    }
 help-cmd-release-browse = Open a release in your browser
 
 help-cmd-release-asset = Commands on a release's attached files
