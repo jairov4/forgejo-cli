@@ -646,6 +646,12 @@ help-arg-pr-view-commits-oneline = View one commit per line
 help-cmd-pr-status = View the mergability and CI status of a pull request
 help-arg-pr-status-id = The pull request to view
 help-arg-pr-status-wait = Wait for all checks to finish before exiting
+help-arg-pr-status-wait-long = Wait for all checks to finish before exiting.
+
+    Exits with 0 when all checks pass (or the PR is merged), 3 when a check fails, 4 when `--timeout` elapses, and 1 on any other error.
+help-arg-pr-status-timeout = Give up waiting after this long (e.g. `50m`, `2h`)
+help-arg-pr-status-interval = Maximum time between status polls
+help-arg-pr-status-grace = How long to wait for checks to appear before assuming there are none
 msg-pr-status-merged = {STYLE("bright-magenta")}Merged{STYLE("reset")} by {$merged_by} on {DATETIME($merged_at, dateStyle: "long", timeStyle: "long")}
 msg-pr-status-header = {$state ->
         [draft] {STYLE("light-grey")}Draft{STYLE("reset")} {-dash} Can't merge draft PR

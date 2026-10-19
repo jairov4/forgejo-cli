@@ -121,9 +121,18 @@ pub enum PrSubcommand {
     Status {
         #[clap(help = h!("arg-pr-status-id"))]
         id: Option<IssueId>,
-        #[clap(help = h!("arg-pr-status-wait"))]
+        #[clap(help = h!("arg-pr-status-wait"), long_help = lh!("arg-pr-status-wait"))]
         #[clap(long)]
         wait: bool,
+        #[clap(help = h!("arg-pr-status-timeout"))]
+        #[clap(long, requires = "wait", value_parser = parse_duration, id = "DURATION")]
+        timeout: Option<std::time::Duration>,
+        #[clap(help = h!("arg-pr-status-interval"))]
+        #[clap(long, requires = "wait", value_parser = parse_duration, default_value = "30s")]
+        interval: std::time::Duration,
+        #[clap(help = h!("arg-pr-status-grace"))]
+        #[clap(long, requires = "wait", value_parser = parse_duration, default_value = "10s")]
+        grace: std::time::Duration,
     },
     #[clap(about = h!("cmd-pr-checkout"))]
     Checkout {
@@ -527,7 +536,20 @@ impl PrCommand {
                     }
                 }
             }
-            Status { id, wait } => view_pr_status(repo, &api, id.map(|id| id.number), wait).await?,
+            Status {
+                id,
+                wait,
+                timeout,
+                interval,
+                grace,
+            } => {
+                let id = id.map(|id| id.number);
+                if wait {
+                    wait_pr_status(repo, &api, id, timeout, interval, grace).await?
+                } else {
+                    view_pr_status(repo, &api, id).await?
+                }
+            }
             Search {
                 query,
                 labels,
@@ -875,53 +897,251 @@ async fn view_pr_labels(repo: &RepoName, api: &Forgejo, pr: Option<i64>) -> eyre
     Ok(())
 }
 
-async fn view_pr_status(
+async fn view_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre::Result<()> {
+    let pr_status = get_pr_status(repo, api, id).await?;
+    print_pr_status(&pr_status)?;
+    Ok(())
+}
+
+/// Exit code when `--wait` finishes with a failing check.
+pub const EXIT_CHECKS_FAILED: i32 = 3;
+/// Exit code when `--wait` gives up because `--timeout` elapsed.
+pub const EXIT_TIMEOUT: i32 = 4;
+
+/// Number of consecutive failed API requests tolerated while waiting.
+const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let num: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration `{s}`, expected e.g. `90`, `30s`, `50m` or `2h`"))?;
+    let secs = match unit {
+        "" | "s" => num,
+        "m" => num * 60,
+        "h" => num * 60 * 60,
+        _ => {
+            return Err(format!(
+                "invalid duration unit `{unit}`, expected `s`, `m` or `h`"
+            ));
+        }
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+enum WaitOutcome {
+    Merged,
+    Green,
+    Red,
+    NoChecks,
+}
+
+/// Classifies a status, or returns `None` if checks are still running.
+fn wait_outcome(pr_status: &PrStatus) -> Option<WaitOutcome> {
+    use forgejo_api::structs::CommitStatusState;
+    match pr_status {
+        PrStatus::Merged { .. } => Some(WaitOutcome::Merged),
+        PrStatus::Open {
+            commit_statuses, ..
+        } => {
+            let states = commit_statuses.iter().flat_map(|x| x.status.as_ref());
+            if commit_statuses.is_empty() {
+                Some(WaitOutcome::NoChecks)
+            } else if states.clone().any(|s| *s == CommitStatusState::Pending) {
+                None
+            } else if states
+                .clone()
+                .any(|s| matches!(s, CommitStatusState::Failure | CommitStatusState::Error))
+            {
+                Some(WaitOutcome::Red)
+            } else {
+                Some(WaitOutcome::Green)
+            }
+        }
+    }
+}
+
+fn pr_status_summary(pr_status: &PrStatus) -> String {
+    match pr_status {
+        PrStatus::Merged { .. } => "merged".into(),
+        PrStatus::Open {
+            pr,
+            commit_statuses,
+        } => {
+            let sha = pr
+                .head
+                .as_ref()
+                .and_then(|h| h.sha.as_deref())
+                .unwrap_or("?");
+            let mut counts = BTreeMap::<&str, usize>::new();
+            for state in commit_statuses.iter().flat_map(|x| x.status.as_ref()) {
+                *counts.entry(commit_state_name(state)).or_default() += 1;
+            }
+            let counts = counts
+                .iter()
+                .map(|(k, v)| format!("{v} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sha = &sha[..sha.len().min(10)];
+            if counts.is_empty() {
+                format!("{sha}: no checks")
+            } else {
+                format!("{sha}: {counts}")
+            }
+        }
+    }
+}
+
+fn commit_state_name(state: &forgejo_api::structs::CommitStatusState) -> &'static str {
+    use forgejo_api::structs::CommitStatusState;
+    match state {
+        CommitStatusState::Success => "success",
+        CommitStatusState::Pending => "pending",
+        CommitStatusState::Warning => "warning",
+        CommitStatusState::Failure => "failure",
+        CommitStatusState::Skipped => "skipped",
+        CommitStatusState::Error => "error",
+    }
+}
+
+/// Whether a failed request is worth retrying while waiting (network trouble or
+/// server-side errors), as opposed to e.g. a missing PR or bad credentials.
+fn is_transient_error(e: &eyre::Report) -> bool {
+    use forgejo_api::{ApiErrorKind, ForgejoError};
+    let retryable = |code: u16| code >= 500 || code == 429;
+    e.chain()
+        .find_map(|e| e.downcast_ref::<ForgejoError>())
+        .is_some_and(|e| match e {
+            ForgejoError::ReqwestError(_) => true,
+            ForgejoError::UnexpectedStatusCode(code) => retryable(code.as_u16()),
+            ForgejoError::ApiError(e) => match e.error_kind() {
+                ApiErrorKind::Generic => true,
+                ApiErrorKind::Other(code) => retryable(code.as_u16()),
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+fn head_sha(pr_status: &PrStatus) -> Option<String> {
+    match pr_status {
+        PrStatus::Merged { .. } => None,
+        PrStatus::Open { pr, .. } => pr.head.as_ref().and_then(|h| h.sha.clone()),
+    }
+}
+
+async fn wait_pr_status(
     repo: &RepoName,
     api: &Forgejo,
     id: Option<i64>,
-    wait: bool,
+    timeout: Option<std::time::Duration>,
+    max_interval: std::time::Duration,
+    grace: std::time::Duration,
 ) -> eyre::Result<()> {
-    if wait {
-        let SpecialRender { fancy, .. } = *crate::special_render();
-        let mut wait_duration = 5.0;
-        let mut prev_statuses_len = 0;
-        let pr_status = loop {
-            let pr_status = get_pr_status(repo, api, id).await?;
-            if fancy {
-                if prev_statuses_len > 0 {
-                    println!("\x1b[{prev_statuses_len}A");
+    use std::time::{Duration, Instant};
+
+    let SpecialRender { fancy, .. } = *crate::special_render();
+    let start = Instant::now();
+    let deadline = timeout.map(|t| start + t);
+    let mut interval = Duration::from_secs(5).min(max_interval);
+    let mut prev_lines = 0;
+    let mut prev_summary = String::new();
+    let mut sha: Option<String> = None;
+    let mut sha_seen_at = start;
+    let mut errors = 0;
+    let mut last_status = None;
+
+    let outcome = loop {
+        match get_pr_status(repo, api, id).await {
+            Ok(pr_status) => {
+                errors = 0;
+                let new_sha = head_sha(&pr_status);
+                if new_sha != sha {
+                    sha = new_sha;
+                    sha_seen_at = Instant::now();
                 }
-                print_pr_status(&pr_status)?;
-            } else {
-                print!(".");
-                std::io::stdout().flush()?;
-            }
-            match &pr_status {
-                PrStatus::Merged { .. } => break pr_status,
-                PrStatus::Open {
-                    commit_statuses, ..
-                } => {
-                    let all_finished = commit_statuses
-                        .iter()
-                        .flat_map(|x| x.status.as_ref())
-                        .all(|state| *state != forgejo_api::structs::CommitStatusState::Pending);
-                    if all_finished {
-                        break pr_status;
+                if fancy {
+                    if prev_lines > 0 {
+                        print!("\x1b[{prev_lines}A\x1b[J");
                     }
-                    prev_statuses_len = commit_statuses.len() + 2;
+                    print_pr_status(&pr_status)?;
+                    prev_lines = match &pr_status {
+                        PrStatus::Open {
+                            commit_statuses, ..
+                        } => commit_statuses.len() + 1,
+                        PrStatus::Merged { .. } => 1,
+                    };
+                } else {
+                    let summary = pr_status_summary(&pr_status);
+                    if summary != prev_summary {
+                        let elapsed = start.elapsed().as_secs();
+                        eprintln!("[{:02}:{:02}] {summary}", elapsed / 60, elapsed % 60);
+                        prev_summary = summary;
+                    }
+                }
+                let outcome = wait_outcome(&pr_status);
+                last_status = Some(pr_status);
+                match outcome {
+                    // Checks may not be registered yet right after a push.
+                    Some(WaitOutcome::NoChecks) if sha_seen_at.elapsed() < grace => (),
+                    Some(outcome) => break Some(outcome),
+                    None => (),
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs_f64(wait_duration)).await;
-            wait_duration *= 1.5;
-        };
-        if !fancy {
-            print_pr_status(&pr_status)?;
+            Err(e) if !is_transient_error(&e) => return Err(e),
+            Err(e) => {
+                errors += 1;
+                if errors >= MAX_CONSECUTIVE_ERRORS {
+                    return Err(e.wrap_err(format!("{errors} consecutive request failures")));
+                }
+                eprintln!(
+                    "warning: failed to fetch status ({errors}/{MAX_CONSECUTIVE_ERRORS}): {e}"
+                );
+            }
         }
-    } else {
-        let pr_status = get_pr_status(repo, api, id).await?;
-        print_pr_status(&pr_status)?;
+
+        let mut sleep = interval;
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            sleep = sleep.min(remaining);
+        }
+        // Don't sleep past the end of the grace period when no checks exist yet.
+        if let Some(PrStatus::Open {
+            commit_statuses, ..
+        }) = &last_status
+            && commit_statuses.is_empty()
+        {
+            let grace_left = grace.saturating_sub(sha_seen_at.elapsed());
+            if !grace_left.is_zero() {
+                sleep = sleep.min(grace_left);
+            }
+        }
+        tokio::time::sleep(sleep).await;
+        interval = interval.mul_f64(1.5).min(max_interval);
+    };
+
+    if !fancy && let Some(pr_status) = &last_status {
+        print_pr_status(pr_status)?;
     }
-    Ok(())
+    std::io::stdout().flush()?;
+
+    match outcome {
+        Some(WaitOutcome::Merged | WaitOutcome::Green) => Ok(()),
+        Some(WaitOutcome::NoChecks) => {
+            eprintln!("no checks reported within the grace period");
+            Ok(())
+        }
+        Some(WaitOutcome::Red) => Err(crate::ExitCode(EXIT_CHECKS_FAILED).into()),
+        None => {
+            eprintln!("timed out waiting for checks");
+            Err(crate::ExitCode(EXIT_TIMEOUT).into())
+        }
+    }
 }
 
 enum PrStatus {
@@ -957,7 +1177,14 @@ async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre:
             })
             .try_flatten()
             .try_collect::<Vec<_>>()
-            .await?;
+            .await
+            .or_else(|e| {
+                if is_empty_combined_status(&e) {
+                    Ok(Vec::new())
+                } else {
+                    Err(e)
+                }
+            })?;
         commit_statuses.sort_by(|a, b| a.context.cmp(&b.context));
 
         Ok(PrStatus::Open {
@@ -965,6 +1192,20 @@ async fn get_pr_status(repo: &RepoName, api: &Forgejo, id: Option<i64>) -> eyre:
             commit_statuses,
         })
     }
+}
+
+/// Forgejo reports `"state": ""` for a commit without any statuses, which
+/// `forgejo_api` can't deserialize.
+fn is_empty_combined_status(e: &forgejo_api::ForgejoError) -> bool {
+    let forgejo_api::ForgejoError::BadStructure(forgejo_api::StructureError::Serde {
+        contents,
+        ..
+    }) = e
+    else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(contents)
+        .is_ok_and(|v| v.get("total_count").and_then(|c| c.as_u64()) == Some(0))
 }
 
 fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
@@ -1000,8 +1241,6 @@ fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
             let mergeable = pr.mergeable.ok_or_eyre("pr does not have mergeable")?;
             ftl_println!("msg-pr-status-header", state, mergeable = mergeable.ftl());
 
-            use forgejo_api::structs::CommitStatusState;
-
             for status in commit_statuses {
                 let state = status
                     .status
@@ -1012,14 +1251,7 @@ fn print_pr_status(pr_status: &PrStatus) -> eyre::Result<()> {
                     .as_deref()
                     .ok_or_eyre("status does not have context")?;
                 print!("{bullet} ");
-                let state = match state {
-                    CommitStatusState::Success => "success",
-                    CommitStatusState::Pending => "pending",
-                    CommitStatusState::Warning => "warning",
-                    CommitStatusState::Failure => "failure",
-                    CommitStatusState::Skipped => "skipped",
-                    CommitStatusState::Error => "error",
-                };
+                let state = commit_state_name(state);
                 ftl_println!("msg-pr-status-entry", state, context);
             }
         }
@@ -2418,3 +2650,19 @@ fn repo_name_from_pr(pr: &forgejo_api::structs::PullRequest) -> eyre::Result<Rep
 //    }
 //    s
 //}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("10s"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_duration("50m"), Ok(Duration::from_secs(3000)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert!(parse_duration("5x").is_err());
+        assert!(parse_duration("m").is_err());
+    }
+}
